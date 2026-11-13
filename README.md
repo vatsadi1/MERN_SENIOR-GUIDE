@@ -116,7 +116,7 @@ Every module following this specification must pass the **Triple Verification Gu
 
 ## 🤝 How to Use This Playbook
 
-* **For New Features:** Start from `01 (Model)` $\rightarrow$ `02 (Constants)` $\rightarrow$ `03 (Validation)` $\rightarrow$ `04 (Route)` $\rightarrow$ `05 (Controller)` $\rightarrow$ `06 (Service)` $\rightarrow$ `07 (BaseService)`.
+* **For New Features:** Start from  `01 (Constants)` $\rightarrow$ `02 (Models)` $\rightarrow$ `03 (Validation)` $\rightarrow$ `04 (Route)` $\rightarrow$ `05 (Controller)` $\rightarrow$ `06 (Service)` $\rightarrow$ `07 (BaseService)`.
 * **For Code Reviews:** Use the checklists inside each document as your **Pull Request (PR) Acceptance Criteria**.
 * **For Team Onboarding:** Share this repository with new engineers to align on architectural conventions.
 

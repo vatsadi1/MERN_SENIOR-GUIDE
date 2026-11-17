@@ -276,21 +276,38 @@ Adjust endpoint paths and error response parsing to match your actual
 API contract.
 
 ``` js
+
 // src/features/shared/services/apiClient.js
 
-const API_BASE_URL = (
-  import.meta.env.VITE_API_URL || 'http://localhost:4000/api/v1'
-).replace(/\/+$/, '');
+const RAW_API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000/api/v1';
+const API_BASE_URL = RAW_API_URL.replace(/\/+$/, '');
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const REFRESH_ENDPOINT = '/auth/refresh';
 const AUTH_ENDPOINTS_WITHOUT_AUTO_REFRESH = new Set([
   '/auth/login',
   '/auth/register',
+  '/customers/auth/send-otp',
+  '/customers/auth/verify-otp',
   REFRESH_ENDPOINT,
 ]);
 
+// In-memory token storage (Fallback & Fast lookup)
+let currentAccessToken = null;
 let refreshPromise = null;
+
+export const tokenStorage = {
+  get: () => currentAccessToken || localStorage.getItem('access_token'),
+  set: (token) => {
+    currentAccessToken = token;
+    if (token) localStorage.setItem('access_token', token);
+    else localStorage.removeItem('access_token');
+  },
+  clear: () => {
+    currentAccessToken = null;
+    localStorage.removeItem('access_token');
+  },
+};
 
 export class ApiError extends Error {
   constructor(message, {
@@ -311,11 +328,14 @@ export class ApiError extends Error {
 }
 
 function buildUrl(endpoint, query) {
-  const normalizedEndpoint = endpoint.startsWith('/')
-    ? endpoint
-    : `/${endpoint}`;
+  const normalizedEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
 
-  const url = new URL(`${API_BASE_URL}${normalizedEndpoint}`);
+  // Safe URL creation for relative production paths (e.g., /api/v1)
+  const base = API_BASE_URL.startsWith('http')
+    ? API_BASE_URL
+    : `${typeof window !== 'undefined' ? window.location.origin : 'http://localhost'}${API_BASE_URL}`;
+
+  const url = new URL(`${base}${normalizedEndpoint}`);
 
   if (query && typeof query === 'object') {
     for (const [key, value] of Object.entries(query)) {
@@ -323,6 +343,10 @@ function buildUrl(endpoint, query) {
 
       if (Array.isArray(value)) {
         value.forEach((item) => url.searchParams.append(key, String(item)));
+      } else if (value instanceof Date) {
+        url.searchParams.set(key, value.toISOString());
+      } else if (typeof value === 'object') {
+        url.searchParams.set(key, JSON.stringify(value));
       } else {
         url.searchParams.set(key, String(value));
       }
@@ -333,12 +357,9 @@ function buildUrl(endpoint, query) {
 }
 
 async function parseResponse(response) {
-  if (response.status === 204 || response.status === 205) {
-    return null;
-  }
+  if (response.status === 204 || response.status === 205) return null;
 
   const contentType = response.headers.get('content-type') || '';
-
   if (contentType.includes('application/json')) {
     try {
       return await response.json();
@@ -353,7 +374,6 @@ async function parseResponse(response) {
 
 function getErrorMessage(data, response) {
   if (typeof data === 'string' && data.trim()) return data;
-
   return (
     data?.error?.message ||
     data?.message ||
@@ -405,8 +425,6 @@ function prepareBody(body, headers) {
     body instanceof ArrayBuffer ||
     typeof body === 'string'
   ) {
-    // Do not manually set multipart Content-Type for FormData:
-    // the browser must add the multipart boundary.
     return body;
   }
 
@@ -422,8 +440,14 @@ function isAuthEndpoint(endpoint) {
   return AUTH_ENDPOINTS_WITHOUT_AUTO_REFRESH.has(normalized);
 }
 
+function notifySessionExpired() {
+  tokenStorage.clear();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('auth:session-expired'));
+  }
+}
+
 async function performRefresh() {
-  // All requests in this tab share this one refresh operation.
   if (!refreshPromise) {
     refreshPromise = (async () => {
       const url = buildUrl(REFRESH_ENDPOINT);
@@ -433,10 +457,12 @@ async function performRefresh() {
         credentials: 'include',
         headers: {
           Accept: 'application/json',
+          'Content-Type': 'application/json',
         },
       });
 
       if (!response.ok) {
+        notifySessionExpired();
         throw new ApiError('Your session has expired. Please log in again.', {
           status: response.status,
           data: await parseResponse(response),
@@ -446,7 +472,13 @@ async function performRefresh() {
         });
       }
 
-      return true;
+      const resData = await parseResponse(response);
+      const newToken = resData?.accessToken || resData?.token || resData?.data?.token;
+      if (newToken) {
+        tokenStorage.set(newToken);
+      }
+
+      return newToken || true;
     })().finally(() => {
       refreshPromise = null;
     });
@@ -455,9 +487,7 @@ async function performRefresh() {
   return refreshPromise;
 }
 
-async function executeRequest(endpoint, options, {
-  retryAfterRefresh = true,
-} = {}) {
+async function executeRequest(endpoint, options, { retryAfterRefresh = true } = {}) {
   const {
     method = 'GET',
     body,
@@ -474,6 +504,12 @@ async function executeRequest(endpoint, options, {
 
   if (!headers.has('Accept')) {
     headers.set('Accept', 'application/json');
+  }
+
+  // Inject Bearer token if available and not already passed
+  const token = tokenStorage.get();
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
   }
 
   const requestBody = prepareBody(body, headers);
@@ -518,20 +554,13 @@ async function executeRequest(endpoint, options, {
 
   const data = await parseResponse(response);
 
-  if (
-    response.status === 401 &&
-    retryAfterRefresh &&
-    !isAuthEndpoint(endpoint)
-  ) {
+  if (response.status === 401 && retryAfterRefresh && !isAuthEndpoint(endpoint)) {
     try {
       await performRefresh();
-
-      // Retry the original request only once.
-      return executeRequest(endpoint, options, {
-        retryAfterRefresh: false,
-      });
+      // Retry once with new token
+      return executeRequest(endpoint, options, { retryAfterRefresh: false });
     } catch (refreshError) {
-      // Auth state/UI should react to this session-expired condition.
+      notifySessionExpired();
       throw refreshError instanceof ApiError
         ? refreshError
         : new ApiError('Your session has expired. Please log in again.', {
@@ -557,23 +586,15 @@ async function executeRequest(endpoint, options, {
 }
 
 const apiClient = {
-  request: (endpoint, options = {}) =>
-    executeRequest(endpoint, options),
-
-  get: (endpoint, options = {}) =>
-    executeRequest(endpoint, { ...options, method: 'GET' }),
-
-  post: (endpoint, body, options = {}) =>
-    executeRequest(endpoint, { ...options, method: 'POST', body }),
-
-  put: (endpoint, body, options = {}) =>
-    executeRequest(endpoint, { ...options, method: 'PUT', body }),
-
-  patch: (endpoint, body, options = {}) =>
-    executeRequest(endpoint, { ...options, method: 'PATCH', body }),
-
-  delete: (endpoint, options = {}) =>
-    executeRequest(endpoint, { ...options, method: 'DELETE' }),
+  request: (endpoint, options = {}) => executeRequest(endpoint, options),
+  get: (endpoint, options = {}) => executeRequest(endpoint, { ...options, method: 'GET' }),
+  post: (endpoint, body, options = {}) => executeRequest(endpoint, { ...options, method: 'POST', body }),
+  put: (endpoint, body, options = {}) => executeRequest(endpoint, { ...options, method: 'PUT', body }),
+  patch: (endpoint, body, options = {}) => executeRequest(endpoint, { ...options, method: 'PATCH', body }),
+  delete: (endpoint, options = {}) => executeRequest(endpoint, { ...options, method: 'DELETE' }),
+  setToken: (token) => tokenStorage.set(token),
+  getToken: () => tokenStorage.get(),
+  clearToken: () => tokenStorage.clear(),
 };
 
 export default apiClient;
